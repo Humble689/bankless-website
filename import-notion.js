@@ -3,6 +3,7 @@
 const path = require("path")
 const axios = require('axios')
 const fs = require('fs')
+const fsp = fs.promises
 const crc32 = require('js-crc').crc32
 
 const DEFAULT_NOTION_ID = '6b3a4ffc3bb146a7873e654f1209d979'
@@ -13,7 +14,14 @@ const NOTION_ID =
   args[2] && args[2].length === 32
     ? args[2]
     : DEFAULT_NOTION_ID
-console.log('NOTION_ID', NOTION_ID)
+
+const log = {
+  info: (message, meta) => console.log(message, meta ?? ''),
+  warn: (message, meta) => console.warn(message, meta ?? ''),
+  error: (message, meta) => console.error(message, meta ?? ''),
+}
+
+log.info('NOTION_ID', { NOTION_ID })
 
 const KEY_MATCHING = {
   'Name': 'name',
@@ -25,93 +33,127 @@ const KEY_MATCHING = {
 }
 
 const slugify = (text) =>
-  text
+  String(text ?? '')
     .toLowerCase()
     .replace(/<[^>]*>?/gm, '') // remove tags
     .replace(/[^a-z0-9 -]/g, '') // remove invalid chars
     .replace(/\s+/g, '-') // collapse whitespace and replace by -
     .replace(/-+/g, '-') // collapse dashes
 
-const download_image = (url, image_path) =>
-  axios({
+const downloadImage = async (url, imagePath) => {
+  const response = await axios({
     url,
     responseType: 'stream',
-  }).then(function (response) {
-    response.data.pipe(fs.createWriteStream(image_path))
+    timeout: 30_000,
+    validateStatus: (status) => status >= 200 && status < 400,
   })
 
-const get_img = (imageLink, slug, image_name) => {
-  const [file_name] = imageLink.split('?')
-  const file_extension = file_name
-    .match(/\.(png|svg|jpg|jpeg|webp|webm|mp4|gif)/)[1]
-    .replace('jpeg', 'jpg')
-  // console.log(file_extension)
-  // create "unique" hash based on Notion imageLink (different when re-uploaded)
-  const hash = crc32(file_name)
-  const image_dir = `/images/${slug}/`
-  const image_path = `${image_dir}${slugify(
-    image_name
-  )}-${hash}.${file_extension}`
-  // console.log('image_path', image_path)
-  const local_image_path = `public${image_path}`
-  if (!fs.existsSync(local_image_path)) {
-    // remove eventual previous image
-    const dirname = path.dirname(local_image_path) + '/'
-    fs.readdirSync(dirname)
-      .filter(f => f.startsWith(slugify(image_name)))
-      .map(f => {
-        console.log('delete previous image:', dirname + f)
-        fs.unlinkSync(dirname + f)
-      })
-
-    // download new image
-    download_image(imageLink, local_image_path)
-    console.log('downloading image: ', local_image_path)
-  }
-  return image_path
+  await new Promise((resolve, reject) => {
+    const writer = fs.createWriteStream(imagePath)
+    response.data.pipe(writer)
+    response.data.on('error', reject)
+    writer.on('error', reject)
+    writer.on('finish', resolve)
+  })
 }
 
-const pages = []
+const getImg = async (imageLink, slug, imageName) => {
+  const [fileName] = String(imageLink ?? '').split('?')
+  const match = fileName.match(/\.(png|svg|jpg|jpeg|webp|webm|mp4|gif)$/i)
+  if (!match) {
+    throw new Error(`Unsupported or missing image extension in: ${fileName}`)
+  }
 
-axios
-  .get(`${POTION_API}/table?id=${NOTION_ID}`)
-  .then((response) => {
-    // console.log(response.data)
-    response.data.map((notion) => {
-      let page = {}
-      // console.log(notion)
-      page = Object.keys(KEY_MATCHING).reduce(
-        (obj, k) =>
-          Object.assign(obj, {
-            [KEY_MATCHING[k]]: notion.fields[k],
-          }),
-        {}
-      )
-      if (page.page.length > 0 && page.image !== undefined) {
-        page.page = page.page[0]
-        if (page.link === null) {
-          delete page.link
-        }
-        page.image = get_img(page.image, page.page, slugify(page.name))
-        pages.push(page)
-      } else {
-        console.log('pb missing field', page)
-      }
-    })
-    // console.log(pages)
-    const departments = pages.filter(page => page.page === 'department')
-    console.log('departments', departments)
+  const fileExtension = match[1].toLowerCase().replace('jpeg', 'jpg')
+  const hash = crc32(fileName)
+  const imageDir = `/images/${slug}/`
+  const imagePath = `${imageDir}${slugify(imageName)}-${hash}.${fileExtension}`
+  const localImagePath = `public${imagePath}`
+  const dirname = path.dirname(localImagePath) + '/'
 
-    const guilds = pages.filter(page => page.page === 'guild')
-    console.log('guilds', guilds)
+  if (!fs.existsSync(localImagePath)) {
+    fs.mkdirSync(dirname, { recursive: true })
 
-    const projects = pages.filter(page => page.page === 'project')
-    console.log('projects', projects)
+    for (const f of fs.readdirSync(dirname)) {
+      if (!f.startsWith(slugify(imageName))) continue
+      const toDelete = dirname + f
+      log.info('delete previous image', { path: toDelete })
+      fs.unlinkSync(toDelete)
+    }
 
-    const workWithUs = pages.filter(page => page.page === 'work-with-us')
-    console.log('work-with-us', workWithUs)
+    log.info('downloading image', { path: localImagePath })
+    await downloadImage(imageLink, localImagePath)
+  }
 
-    const fileContent = `import { ProjectType } from 'entities/project'
+  return imagePath
+}
+
+const main = async () => {
+  const pages = []
+
+  const response = await axios.get(`${POTION_API}/table?id=${NOTION_ID}`, {
+    timeout: 30_000,
+    validateStatus: (status) => status >= 200 && status < 400,
+  })
+
+  if (!Array.isArray(response.data)) {
+    throw new Error('Potion API returned unexpected response shape')
+  }
+
+  for (const notion of response.data) {
+    const page = Object.keys(KEY_MATCHING).reduce(
+      (obj, k) =>
+        Object.assign(obj, {
+          [KEY_MATCHING[k]]: notion.fields?.[k],
+        }),
+      {}
+    )
+
+    const pageType = Array.isArray(page.page) ? page.page[0] : page.page
+    const hasPageType = typeof pageType === 'string' && pageType.length > 0
+    const hasImage = typeof page.image === 'string' && page.image.length > 0
+
+    if (!hasPageType || !hasImage) {
+      log.warn('Skipping row due to missing required fields', {
+        name: page.name,
+        page: page.page,
+        image: page.image,
+      })
+      continue
+    }
+
+    page.page = pageType
+    if (page.link === null) {
+      delete page.link
+    }
+
+    try {
+      page.image = await getImg(page.image, page.page, slugify(page.name))
+    } catch (err) {
+      log.warn('Skipping row due to image processing error', {
+        name: page.name,
+        page: page.page,
+        error: err instanceof Error ? err.message : err,
+      })
+      continue
+    }
+
+    pages.push(page)
+  }
+
+  const departments = pages.filter(page => page.page === 'department')
+  const guilds = pages.filter(page => page.page === 'guild')
+  const projects = pages.filter(page => page.page === 'project')
+  const workWithUs = pages.filter(page => page.page === 'work-with-us')
+
+  log.info('export summary', {
+    departments: departments.length,
+    guilds: guilds.length,
+    projects: projects.length,
+    workWithUs: workWithUs.length,
+  })
+
+  const fileContent = `import { ProjectType } from 'entities/project'
 
 export const DEPARTMENTS: ProjectType[] = ${JSON.stringify(departments, null, 2)}
 
@@ -121,16 +163,15 @@ export const PROJECTS: ProjectType[] = ${JSON.stringify(projects, null, 2)}
 
 export const WORK_WITH_US: ProjectType[] = ${JSON.stringify(workWithUs, null, 2)}
 `
-    const filePath = `constants/data.ts`
-    fs.writeFile(
-      filePath,
-      fileContent,
-      (error) => {
-        if (error) throw error
-      }
-    )
-    console.log(`export done -> check ${filePath}`)
+
+  const filePath = `constants/data.ts`
+  await fsp.writeFile(filePath, fileContent)
+  log.info('export done', { filePath })
+}
+
+main().catch((error) => {
+  log.error('Notion import failed', {
+    error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
   })
-  .catch((error) => {
-    console.log(error)
-  })
+  process.exitCode = 1
+})

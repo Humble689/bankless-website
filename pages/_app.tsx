@@ -8,6 +8,7 @@ import PageContainer from 'components/_common/page-container'
 import Head from 'next/head'
 import { useRouter } from 'next/router'
 import { useEffect, useState } from 'react'
+import { logger, normalizeError } from 'utils/logger'
 
 function MyApp({ Component, pageProps }: AppProps) {
   const router = useRouter()
@@ -26,7 +27,10 @@ function MyApp({ Component, pageProps }: AppProps) {
         }
         setIsRouteValid(true)
       } catch (error) {
-        console.error('Routing error:', error)
+        logger.error('Routing error', {
+          pathname: router.pathname,
+          error: normalizeError(error),
+        })
       } finally {
         setIsLoading(false)
       }

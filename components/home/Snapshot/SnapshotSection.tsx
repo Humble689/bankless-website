@@ -3,6 +3,7 @@ import { proposal, sortPropByState } from 'components/utils/snapshot'
 import React, { useEffect, useState } from 'react'
 import Column from './Column'
 import ProposalList from './ProposalList'
+import { logger, normalizeError } from 'utils/logger'
 
 const snapshotURL = 'https://hub.snapshot.org/graphql'
 const snapshotQuery = `
@@ -38,37 +39,52 @@ const SnapshotSection = () => {
   const [closedProposals, setClosedProposals] = useState<proposal[]>([])
 
   useEffect(() => {
+    const abortController = new AbortController()
+
     const fetchSnapshot = async () => {
       try {
         const res = await fetch(snapshotURL, {
           method: 'Post',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ query: snapshotQuery }),
+          signal: abortController.signal,
         })
-        if (res.ok === false) {
-          console.error(
-            'An error occured communicating with the snapshot GraphQL API'
+        if (!res.ok) {
+          throw new Error(
+            `Snapshot API request failed: ${res.status} ${res.statusText}`
           )
-        } else {
-          const result = await res.json()
-          const proposals = result.data.proposals
-          const sortedProps: sorted = sortPropByState(proposals)
-          const active = sortedProps?.active
-          const closed = sortedProps?.closed
-          if (active) {
-            setActiveProposals(active)
-          }
-          if (closed) {
-            setClosedProposals(closed)
-          }
-          setIsLoading(false)
+        }
+
+        const result = await res.json()
+        const proposals = result?.data?.proposals
+        if (!Array.isArray(proposals)) {
+          throw new Error('Snapshot API returned unexpected response shape')
+        }
+
+        const sortedProps: sorted = sortPropByState(proposals)
+        const active = sortedProps?.active
+        const closed = sortedProps?.closed
+        if (active) {
+          setActiveProposals(active)
+        }
+        if (closed) {
+          setClosedProposals(closed)
         }
       } catch (e) {
-        console.log('error', e)
+        if ((e as { name?: string })?.name === 'AbortError') return
+        logger.warn('Failed to fetch Snapshot proposals', {
+          error: normalizeError(e),
+        })
+      } finally {
+        setIsLoading(false)
       }
     }
 
     fetchSnapshot()
+
+    return () => {
+      abortController.abort()
+    }
   }, [])
 
   if (isLoading) {

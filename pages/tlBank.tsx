@@ -50,6 +50,7 @@ import { init, useConnectWallet } from '@web3-onboard/react'
 import { useSetChain } from '@web3-onboard/react'
 import { BigNumber, ethers } from 'ethers'
 import { providers } from '@0xsequence/multicall'
+import { logger, normalizeError } from 'utils/logger'
 
 const API = process.env.NEXT_PUBLIC_BLOCKNATIVE_API_KEY
 
@@ -93,6 +94,11 @@ const settings = {
 
 const alchemy = new Alchemy(settings)
 
+const maskAddress = (addr?: string) =>
+  typeof addr === 'string' && addr.length > 10
+    ? `${addr.slice(0, 6)}…${addr.slice(-4)}`
+    : addr
+
 function TlBank() {
   const [tabUnlock, setTabUnlock] = useState(false)
   const [value, setValue] = useState(BigNumber.from('40000000000000000000000'))
@@ -118,20 +124,26 @@ function TlBank() {
   const [, setChain] = useSetChain()
 
   const connectOrDisconnect = async () => {
-    if (wallet) {
-      disconnect(wallet)
-      return
-    }
+    try {
+      if (wallet) {
+        disconnect(wallet)
+        return
+      }
 
-    const [connected] = await connect()
-    if (!connected) {
-      console.info('Connection did not happen')
-      return
-    }
+      const [connected] = await connect()
+      if (!connected) {
+        logger.info('Wallet connection was cancelled or failed')
+        return
+      }
 
-    const [chain] = connected.chains
-    if (!supportedChains.find(c => c.id === chain.id)) {
-      await setChain({ chainId: supportedChains[0].id })
+      const [chain] = connected.chains
+      if (!supportedChains.find(c => c.id === chain.id)) {
+        await setChain({ chainId: supportedChains[0].id })
+      }
+    } catch (err) {
+      logger.warn('Wallet connect/disconnect error', {
+        error: normalizeError(err),
+      })
     }
   }
 
@@ -182,24 +194,35 @@ function TlBank() {
       multicallProvider
     )
 
+    const tokenCount = userNFTBalance.toNumber()
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const tokenRequests: any[] = []
-    for (let i = 0; i < userNFTBalance; i++) {
+    for (let i = 0; i < tokenCount; i++) {
       const tokenIdRequest = contract.tokenOfOwnerByIndex(address, i)
       tokenRequests.push(tokenIdRequest)
     }
 
     const tokenIds = await Promise.all(tokenRequests)
     const dataRequests = tokenIds.map(async tokenId => {
+      const tokenIdNumber = tokenId.toNumber()
       try {
         const request = await fetch(
-          `${METADATA_BASE_URL}/ethereum/${TLBankToken.toLowerCase()}/${tokenId}`
+          `${METADATA_BASE_URL}/ethereum/${TLBankToken.toLowerCase()}/${tokenIdNumber}`
         )
+        if (!request.ok) {
+          throw new Error(
+            `Metadata request failed: ${request.status} ${request.statusText}`
+          )
+        }
         const response = await request.json()
-        response.tokenId = tokenId.toNumber()
+        response.tokenId = tokenIdNumber
         return response
       } catch (error) {
-        console.error('Error:', error)
+        logger.warn('Failed to fetch NFT metadata', {
+          tokenId: tokenIdNumber,
+          error: normalizeError(error),
+        })
+        return { tokenId: tokenIdNumber, metadataError: true }
       }
     })
 
@@ -254,11 +277,22 @@ function TlBank() {
     setUnlockDate(getUnlockDate('-', date, 6))
     const endDateRaw = getUnlockDateRaw(date, 6)
     setUnlockDateRaw(endDateRaw)
-    bootstrapNonWallet()
-    if (address && wallet?.chains[0]?.id === CHAIN_ID) {
-      bootstrapWallet(address).then(() => {
-        getUserTokens()
+    bootstrapNonWallet().catch(err => {
+      logger.warn('Failed to bootstrap non-wallet stats', {
+        error: normalizeError(err),
       })
+    })
+    if (address && wallet?.chains[0]?.id === CHAIN_ID) {
+      bootstrapWallet(address)
+        .then(() => {
+          return getUserTokens()
+        })
+        .catch(err => {
+          logger.warn('Failed to bootstrap wallet data', {
+            address: maskAddress(address),
+            error: normalizeError(err),
+          })
+        })
     }
   }, [address, wallet])
 
@@ -298,7 +332,11 @@ function TlBank() {
       await bootstrapWallet(address)
       await getUserTokens()
     } catch (err) {
-      console.error(err)
+      logger.error('Lock flow failed', {
+        address: maskAddress(address),
+        value: value?.toString?.(),
+        error: normalizeError(err),
+      })
     } finally {
       setLoading(false)
     }
@@ -327,7 +365,11 @@ function TlBank() {
       })
       setData(updatedData)
     } catch (err) {
-      console.error(err)
+      logger.error('Relock flow failed', {
+        address: maskAddress(address),
+        tokenId: selectedToken?.tokenId,
+        error: normalizeError(err),
+      })
     } finally {
       setLoading(false)
     }
@@ -342,7 +384,11 @@ function TlBank() {
       await bootstrapWallet(address)
       await getUserTokens()
     } catch (err) {
-      console.error(err)
+      logger.error('Unlock flow failed', {
+        address: maskAddress(address),
+        tokenId: selectedToken?.tokenId,
+        error: normalizeError(err),
+      })
     } finally {
       setLoading(false)
     }
@@ -352,23 +398,27 @@ function TlBank() {
     if (data.length > 0) {
       return (
         <HStack pt={10}>
-          {data.map((each, i) => (
+          {data.map((each, i) => {
+            if (!each || each.metadataError) return null
+            const tokenId = each?.tokenId ?? tokens[i]
+            if (!tokenId) return null
+            return (
             <Box
               bg='rgba(255, 255, 255, 0.1)'
               w='30%'
               color='white'
-              key={i}
+              key={tokenId}
               borderRadius={2}
               borderColor='#D02128'
-              borderWidth={selectedToken?.tokenId === tokens[i] ? '5px' : '0px'}
+              borderWidth={selectedToken?.tokenId === tokenId ? '5px' : '0px'}
               _hover={{ bg: 'red.500' }}
               onClick={() =>
                 setSelectedToken({
-                  tokenId: tokens[i],
+                  tokenId,
                   newUnlockDate: each.unlockDate,
                   unlockDate: each.unlockTimestamp,
                   lockDate: each.date,
-                  amount: each.assetCurrency.amount,
+                  amount: each.assetCurrency?.amount,
                   unlockable:
                     new Date().getTime() / 1000 > each.unlockTimestamp,
                 })
@@ -376,7 +426,8 @@ function TlBank() {
             >
               <Image src={each?.image} alt={each?.title} />
             </Box>
-          ))}
+            )
+          })}
         </HStack>
       )
     } else {
